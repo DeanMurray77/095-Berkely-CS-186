@@ -1,65 +1,241 @@
-//I think that I'm on the right track. Pausing is working correctly.
-//comment the drain events to make sure that I'm properly calling the parseChunk function.
-//The other issue is that I don't think that I'm going to call parseChunk enough times.
+//There is an eventStream npm module. I should look into that.
+//I also need to understand pipe--they sound like they could be useful
 
+//This is a pull system. Could I still introduce some kind of batching?
+//Would that speed things up?
+
+//I don't like having a ton of global variables, but event listeners require having global variables
 
 const fs = require('fs')
 
 let writeStreamMatches = fs.createWriteStream("./rendevousMatchData.txt", {flags: 'a'});
-let readStream = fs.createReadStream('./rendevousData.txt');
+let readStream = fs.createReadStream('./rendevousDataSmall.txt');
 let writeStreamSingles = fs.createWriteStream("./rendevousRemainders.txt", {flags: 'a'});
 
 let chunkCounter = 0; //Tracks number chunks read in from disk.
 let numberCounter = 0; //Tracks total number of data points read in and parsed
 let singleCounter = 0; //Tracks total number of un-matched data points
 let matchCounter = 0; //Tracks total number of matched data points.
-let chunkArray = []; //Stores incoming chunks
+let incommingChunk; //Stores incoming chunks (still buffer)
+let numbers = []; //incoming chunk plus remainder converted to string array
 let dataMap = new Map(); //Map for storing unique numbers in hopes of rendevous
 const sumTarget = 50000; //Number that the two pairs need to add up to
-let matchedPairs = ''; //Stores matched pairs for later writing to disk.
-let singles = ''; //Stores numbers not matched & duplicate to something already in map
-let chunkRemainder = ''; //used to store the end of each chunk after the split. Addresses chunks
-//containing only part of a number.
+let singlesFromMap = []; //Stores numbers not matched & duplicate to something already in map
+let chunkRemainder = ''; //used to store the end of each chunk after the split. Addresses chunks containing only part of a number.
 
-let writeMatchesNoBackPressure = true; //used to track if we're experiencing back pressure
-let writeSinglesNoBackPressure = true; //used to track if we're experiencing back pressure
 let readEnded = false; //used to track that the incoming data has been consumed
-let parseChunkPaused = false; //used to track whether or not parseChunk function has been paused
-let parseChunkPausedCounter = 0; //Tracks number of times that the parseChunk needs to be called due to pausing
 
-// chunkArray[0] = '25000 Number-1,25000 Number-2,48000 Number-3,2000 Number-4,2000 Number-5,2000 Number-6';
+// incommingChunk[0] = '25000 Number-1,25000 Number-2,48000 Number-3,2000 Number-4,2000 Number-5,2000 Number-6';
 // parseChunk();
 
 readStream.on('data', (chunk) => {
     //Reads in the data
     chunkCounter++;
-    chunkArray.push(chunk);
-    console.log("Chunk: " + chunkCounter + " current length: " + chunkArray.length);
-    if(chunkArray.length > 3) {
-        //Pause when 4 chunks are in memory to avoid using too much in the way of ram.
-        //Would need fine-tuned to know what the correct number is.
-        //Trying to batch input as that is faster than repeated smaller calls to stream in
-        console.log("Pausing input");
-        readStream.pause();
-    }
-    setTimeout(()=> {
-        parseChunk()
-    }, 1000)
-    // parseChunk(); //Parse the incomming data
+    incommingChunk = chunk;
+    console.log("Chunk: " + chunkCounter);
+
+    // console.log("Pausing input");
+    readStream.pause();
+
+    prepChunk(); //Parse the incomming data
 });
 
 readStream.on('end', () => {
+    debugger
     //Once all of that data has been streamed in, set readEnded variable to change flow
     //and eventually write out the matches and singles data still in memory
     console.log('Read end registered. Done reading in stream of data');
     readEnded = true;
-    if(chunkArray.length == 0) {
-        console.log("Final Write from readStream end event");
-        finalWrite();
-    }
+
+    console.log("Final Write from readStream end event");
+    // prepChunk();
+
+    finalWrite();
 })
 
+function prepChunk() {
+    //Populates the numbers array (global variable)
+    //deals with chunks breaking data via the chunk remainder
+    let currentChunk = incommingChunk.toString();
+    currentChunk = chunkRemainder + currentChunk;
+    chunkRemainder = '';
+    numbers = currentChunk.split(',');
+    if(!readEnded) {
+        chunkRemainder = numbers.pop();
+    }
+    // console.log("Numbers (prep chunk) " + numbers)
+    parseChunk();
+};
 
+function parseChunk() {
+    //parses all numbers in the chunk, writing out matches.
+    //preference is given for older data, meaning it stays in the map when
+    //a duplicate is found, and the new data gets written out.
+
+    
+
+
+
+    // console.log("One chunk is " + numbers.length + " numbers");
+    // console.log("Chunk: " + numbers);
+
+    if(numbers.length == 0 && !readEnded) {
+        debugger;
+        //Resume readStream if all chunks have been pulled into parseChunk()
+        // console.log("Numbers is zero'd out. Resuming Read")
+        readStream.resume();
+        return;
+    }
+
+    if(readEnded && numbers.length == 0) {
+        debugger;
+        //Finished read stream and parsing
+        // console.log("Final Write from parseChunk");
+        // finalWrite();
+        return;
+    }
+
+    numberCounter++;
+    if(numberCounter%1000 == 0) {
+        console.log("Parsing chunk. Count: " + numberCounter);
+    }
+    var currentNumber = parseNumberString(numbers.shift()); //tested
+
+    // console.log("in for loop. i=" + i + " current number: " + currentNumber);
+    // console.log("type of number: " + typeof currentNumber);
+
+    //Check for pair:
+    let pair = checkMap(sumTarget - currentNumber.number); //tested
+    // console.log("In parseChunck. Pair: " + pair);
+
+    // console.log("in for loop. i=" + i + " pair: " + pair);
+
+    if(pair) {
+        //Pair present - write to matched number array
+
+        // console.log("In if(pair)");
+
+        dataMap.delete(pair.number);
+        writeMatches(pair, currentNumber);
+        // console.log("in if(pair) i=" + i + "matchedPairs: " + matchedPairs);
+    } else {
+        //Not a match. Write to map or write out to singles file
+        let alreadyPresent = checkMap(currentNumber.number);
+
+        // console.log("Not a pair. alreadyPresent = " + alreadyPresent);
+
+        if(!alreadyPresent) {
+            //Not a match, but number not present already. write to map.
+
+            // console.log("In !alreadyPresent");
+
+            dataMap.set(currentNumber.number, currentNumber.description);
+            // console.log("in !alreadyPresent. Printing map:");
+            // printMap();
+            parseChunk();
+        } else {
+            //number already present in map. Write to disk (singles file)
+            // console.log("Not a pair, not already present. Writing to singles file;")
+            writeSingles(currentNumber, 'parseChunk'); //tested
+        }
+    }
+}
+
+
+function finalWrite() {
+    // writeSingles();
+    // writeMatches();
+    writeMapToSingles();
+    console.log("Rendevous Complete:")
+    console.log(`Total data points read in: ${numberCounter}`);
+    console.log(`Total matches: ${matchCounter}`);
+    console.log(`Total unmatched data points: ${singleCounter}`);
+}
+
+function writeMatches(olderObject, newObject) {
+    // console.log("In writeMatches");
+
+    matchCounter += 2;
+    let matchObject = {
+        firstNumber: olderObject.number,
+        firstDescription: olderObject.description,
+        secondNumber: newObject.number,
+        secondDescription: newObject.description
+    };
+
+    let matchedNumber = JSON.stringify(matchObject) + ",";
+    let noBackPressure = writeStreamMatches.write(matchedNumber);
+
+    // console.log("writeMatches. noBackPressure? " + noBackPressure);
+    if(noBackPressure) {
+        // console.log("writeMatches, no backPressure. Calling ParseChunk again");
+        parseChunk();
+    }
+}
+// function queueMatches(olderObject, newObject) {
+//     //tested
+//     matchCounter += 2;
+//     // console.log("In queueMatches. older object: " + olderObject + " newObject: " + newObject);
+//     let matchObject = {
+//         firstNumber: olderObject.number,
+//         firstDescription: olderObject.description,
+//         secondNumber: newObject.number,
+//         secondDescription: newObject.description
+//     };
+
+//     matchedPairs += JSON.stringify(matchObject) + ",";
+
+//     // console.log("In queueMatches. MatchedPairs: " + matchedPairs);
+
+//     if(matchedPairs.length > 1400) {
+//         writeMatches();
+//     }
+// }
+
+// function writeMatches() {
+//     console.log("In writeMatches");
+//     if(writeMatchesNoBackPressure) {
+//         writeMatchesNoBackPressure = writeStreamMatches.write(matchedPairs);
+//         console.log("Writing matches. No back pressure? " + writeMatchesNoBackPressure);
+//         matchedPairs = '';
+//     }
+// }
+
+writeStreamSingles.on('error', (error) => {
+    console.log("Error in writeStreamSingles: " + error);
+})
+
+writeStreamMatches.on('error', (error) => {
+    console.log("Error in writeStreamMatches: " + error);
+})
+
+writeStreamSingles.on('drain', () => {
+    //Backpressure relieved. Resume parsing
+    // console.log("Drain event received for writeStreamSingles");
+    if(numbers.length > 0) {
+        parseChunk();
+    } else {
+        consumeSinglesFromMap();
+    }
+
+});
+
+writeStreamMatches.on('drain', () => {
+    //Backpressure relieved. Resume Parsing
+    // console.log("Drain event received for writeStreamMatches");
+    if(numbers.length > 0) {
+        parseChunk();
+    } else {
+        consumeSinglesFromMap();
+    }
+});
+
+function printMap() {
+    //tested
+    dataMap.forEach((value, key) => {
+        console.log(`Map value: ${value}, key: ${key}`);
+    })
+}
 
 //Thoughts:
 // Push the data into an array of chunks. When I get to four chunks, pause.
@@ -103,226 +279,44 @@ function parseNumberString(numberString) {
     };
 }
 
-function parseChunk() {
-    //parses all numbers in the chunk, writing out matches.
-    //preference is given for older data, meaning it stays in the map when
-    //a duplicate is found, and the new data gets written out.
-
-    if(!writeSinglesNoBackPressure || !writeMatchesNoBackPressure) {
-        let problemStream = '';
-        if(!writeMatchesNoBackPressure && !writeSinglesNoBackPressure) {
-            problemStream = 'both writes have';
-        } else if (!writeSinglesNoBackPressure) {
-            problemStream = 'single write has';
-        } else {
-            problemStream = 'match write has';
-        }
-        parseChunkPaused = true;
-        console.log("Pressure valve in parse Chunk because " + problemStream + " backpressure");
-        // parseChunkPausedCounter++
-        return;
-    }
-
-    console.log("Parsing chunk");
-    let currentChunk = chunkArray.shift();
-    currentChunk = currentChunk.toString();
-    currentChunk = chunkRemainder + currentChunk;
-    let numbers = currentChunk.split(',');
-    if(chunkArray.length > 0 || !readEnded) {
-        chunkRemainder = numbers.pop();
-    }
-
-    // console.log("One chunk is " + numbers.length + " numbers");
-    // console.log("Chunk: " + numbers);
-    for(let i=0;i<numbers.length;i++) {
-        numberCounter++;
-        var currentNumber = parseNumberString(numbers[i]); //tested
-
-        // console.log("in for loop. i=" + i + " current number: " + currentNumber);
-        // console.log("type of number: " + typeof currentNumber);
-
-        //Check for pair:
-        let pair = checkMap(sumTarget - currentNumber.number); //tested
-
-        // console.log("in for loop. i=" + i + " pair: " + pair);
-
-        if(pair) {
-            //Pair present - write to matched number array
-
-            // console.log("In if(pair) i=" + i);
-
-            dataMap.delete(pair.number);
-            queueMatches(pair, currentNumber);
-            // console.log("in if(pair) i=" + i + "matchedPairs: " + matchedPairs);
-            continue;
-        }
-
-        let alreadyPresent = checkMap(currentNumber.number);
-
-        // console.log("In for loop i=" + i + " alreadyPresent = " + alreadyPresent);
-
-        if(!alreadyPresent) {
-            //Not a match, but number not present already. write to map.
-
-            // console.log("In !alreadyPresent. i=" + i);
-
-            dataMap.set(currentNumber.number, currentNumber.description);
-            // console.log("in !alreadyPresent. Printing map:");
-            // printMap();
-            continue;
-        }
-
-        queueSingles(currentNumber); //tested
-        // console.log("in if statament. i=" + i + " singles: "+singles);
-    }
-
-    //Resume read string if all chunks have been pulled into parseChunk()
-    if(chunkArray.length == 0 && !readEnded) {
-        readStream.resume();
-    }
-
-    if(chunkArray.length == 0 && readEnded) {
-        console.log("Final Write from parseChunk");
-        finalWrite();
-    }
-}
-
-function finalWrite() {
-    writeSingles();
-    writeMatches();
-    writeMapToSingles();
-    console.log("Rendevous Complete:")
-    console.log(`Total data points read in: ${numberCounter}`);
-    console.log(`Total matches: ${matchCounter}`);
-    console.log(`Total unmatched data points: ${singleCounter}`);
-}
-
 function writeMapToSingles() {
+    debugger
     let mapWriteCounter = 0;
+    // printMap();
     console.log("Entering writeMapToSingles. Counter: " + singleCounter);
     dataMap.forEach((value, key) => {
-        queueSingles({
+        singlesFromMap.push({
             number: key,
             description: value
         })
         mapWriteCounter++
     })
-    console.log("mapWriteCounter: " +mapWriteCounter);
-    writeSingles(); //Need to check this if I had problems
+    // console.log("mapWriteCounter: " +mapWriteCounter);
+    consumeSinglesFromMap();
 }
 
-function queueSingles(numberToQueue) {
-    //tested
-    singleCounter++;
-    singles += JSON.stringify(numberToQueue) + ",";
-
-    if(singles.length > 3400) {
-        writeSingles();
-    }
-};
-
-function writeSingles() {
-    console.log("In writeSingles");
-    if(writeSinglesNoBackPressure) {
-        writeSinglesNoBackPressure = writeStreamSingles.write(singles);
-        console.log("Writing singles. No back pressure? " + writeSinglesNoBackPressure);
-        singles = '';
+function consumeSinglesFromMap() {
+    if(singlesFromMap.length > 0) {
+        let mapSingle = singlesFromMap.shift();
+        writeSingles(mapSingle, 'consumeSinglesFromMap');
     }
 }
 
-function queueMatches(olderObject, newObject) {
-    //tested
-    matchCounter += 2;
-    // console.log("In queueMatches. older object: " + olderObject + " newObject: " + newObject);
-    let matchObject = {
-        firstNumber: olderObject.number,
-        firstDescription: olderObject.description,
-        secondNumber: newObject.number,
-        secondDescription: newObject.description
-    };
+function writeSingles(numberToQueue, calledFrom) {
+    // console.log("In writeSingles");
 
-    matchedPairs += JSON.stringify(matchObject) + ",";
+    singleCounter++
+    let singleNumber = JSON.stringify(numberToQueue) + ",";
+    let noBackPressure = writeStreamSingles.write(singleNumber);
 
-    // console.log("In queueMatches. MatchedPairs: " + matchedPairs);
-
-    if(matchedPairs.length > 1400) {
-        writeMatches();
-    }
-}
-
-function writeMatches() {
-    console.log("In writeMatches");
-    if(writeMatchesNoBackPressure) {
-        writeMatchesNoBackPressure = writeStreamMatches.write(matchedPairs);
-        console.log("Writing matches. No back pressure? " + writeMatchesNoBackPressure);
-        matchedPairs = '';
-    }
-}
-
-writeStreamSingles.once('error', (error) => {
-    console.log("Error in writeStreamSingles: " + error);
-})
-
-writeStreamMatches.once('error', (error) => {
-    console.log("Error in writeStreamMatches: " + error);
-})
-
-writeStreamSingles.once('drain', () => {
-    //Backpressure relieved. Write data
-    console.log("Drain event received for writeStreamSingles");
-    console.log("ParseChunkPaused: " + parseChunkPaused);
-    console.log("writeSinglesNoBackPressure: " + writeSinglesNoBackPressure);
-    console.log("writeMatchesNoBackPressure: " + writeMatchesNoBackPressure);
-    // console.log("parseChunkPausedCounter: " + parseChunkPausedCounter);
-
-    writeSinglesNoBackPressure = true;
-    writeSingles();
-
-    if(parseChunkPaused) {
-        // && writeMatchesNoBackPressure) {
-        // && writeSinglesNoBackPressure 
-        console.log("In parse chunk caller inside of matches write");
-        //parseChunk currently paused, but single/matches backpressure is gone. Resume chunk parsing
-        parseChunkPaused = false;
+    // console.log("writeSingles. noBackPressure? " + noBackPressure);
+    if(noBackPressure && calledFrom == 'parseChunk') {
+        // console.log("writeSingles, no backPressure. Calling ParseChunk again");
         parseChunk();
-        // while(parseChunkPausedCounter > 0) {
-        //     parseChunk();
-        //     parseChunkPausedCounter--;
-        // }
     }
-});
 
-writeStreamMatches.once('drain', () => {
-    //Backpressure relieved. Write data
-    console.log("Drain event received for writeStreamMatches");
-    console.log("ParseChunkPaused: " + parseChunkPaused);
-    console.log("writeSinglesNoBackPressure: " + writeSinglesNoBackPressure);
-    console.log("writeMatchesNoBackPressure: " + writeMatchesNoBackPressure);
-    // console.log("parseChunkPausedCounter: " + parseChunkPausedCounter);
-
-    writeMatchesNoBackPressure = true;
-    writeMatches();
-    console.log("After write matches")
-    console.log("ParseChunkPaused: " + parseChunkPaused);
-    console.log("writeSinglesNoBackPressure: " + writeSinglesNoBackPressure);
-    console.log("writeMatchesNoBackPressure: " + writeMatchesNoBackPressure);
-    if(parseChunkPaused) {
-        //  && writeSinglesNoBackPressure) {
-    //  && writeMatchesNoBackPressure) {
-        console.log("In parse chunk caller inside of matches write");
-        //parseChunk currently paused, but single/matches backpressure is gone. Resume chunk parsing
-        parseChunkPaused = false;
-        parseChunk();
-        // while(parseChunkPausedCounter > 0) {
-        //     parseChunk();
-        //     parseChunkPausedCounter--;
-        // }
+    if(noBackPressure && calledFrom == 'consumeSinglesFromMap') {
+        // console.log("consuming singlesFromMap")
+        consumeSinglesFromMap();
     }
-});
-
-function printMap() {
-    //tested
-    dataMap.forEach((value, key) => {
-        console.log(`Map value: ${value}, key: ${key}`);
-    })
 }
